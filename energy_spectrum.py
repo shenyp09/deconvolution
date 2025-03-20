@@ -864,6 +864,7 @@ class DeconvolutionProcessor:
     def process_spectra(self, original_spectra, noisy_spectra):
         """处理多个能谱并返回反卷积结果"""
         deconvolved_spectra = []
+        preprocessed_spectra = []  # 保存预处理后的能谱
         
         print("开始反卷积处理...")
         if self.filter_type:
@@ -879,6 +880,9 @@ class DeconvolutionProcessor:
             if self.filter_type:
                 print(f"  应用{self.filter_type}滤波预处理...")
                 current_spectrum = self.apply_filter(current_spectrum)
+            
+            # 保存预处理后的能谱
+            preprocessed_spectra.append(current_spectrum.copy())
             
             # 根据选择的算法执行反卷积
             if self.algorithm == 'hybrid':
@@ -901,6 +905,8 @@ class DeconvolutionProcessor:
         
         print(f"反卷积处理完成，耗时 {time.time() - start_time:.2f} 秒")
         
+        # 返回反卷积结果和预处理后的能谱
+        self.preprocessed_spectra = preprocessed_spectra
         return deconvolved_spectra
     
     def visualize_results(self, x, original_spectra, noisy_spectra, deconvolved_spectra, output_file="deconvolution_results.html"):
@@ -909,6 +915,9 @@ class DeconvolutionProcessor:
         fig = make_subplots(rows=num_spectra, cols=1, 
                            subplot_titles=[f"能谱 {i+1} 反卷积结果" for i in range(num_spectra)],
                            vertical_spacing=0.05)
+        
+        # 获取预处理后的能谱，如果不存在则为None
+        preprocessed_spectra = getattr(self, 'preprocessed_spectra', None)
         
         for i in range(num_spectra):
             fig.add_trace(
@@ -922,6 +931,14 @@ class DeconvolutionProcessor:
                           line=dict(color='red')),
                 row=i+1, col=1
             )
+            
+            # 如果有预处理后的能谱，添加预处理曲线
+            if preprocessed_spectra is not None:
+                fig.add_trace(
+                    go.Scatter(x=x, y=preprocessed_spectra[i], mode='lines', name='预处理后能谱', 
+                              line=dict(color='purple', dash='dash')),
+                    row=i+1, col=1
+                )
             
             fig.add_trace(
                 go.Scatter(x=x, y=deconvolved_spectra[i], mode='lines', name='反卷积结果', 
