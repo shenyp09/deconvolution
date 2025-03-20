@@ -159,9 +159,62 @@ class EnergySpectrumGenerator:
                 row=i+1, col=1
             )
         
-        fig.update_layout(height=500*self.num_spectra, width=1000, 
-                         title="能谱数据集可视化",
-                         showlegend=False)
+        # 动态生成Y轴配置
+        linear_args = {}
+        log_args = {}
+        for i in range(1, self.num_spectra + 1):
+            axis_name = f"yaxis{i if i > 1 else ''}"
+            linear_args[f"{axis_name}.type"] = "linear"
+            log_args[f"{axis_name}.type"] = "log"
+        
+        # 添加按钮以切换对数/线性Y轴
+        fig.update_layout(
+            height=500*self.num_spectra, 
+            width=1000, 
+            title_text="能谱数据集可视化",
+            title_font=dict(size=24),
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            updatemenus=[
+                dict(
+                    buttons=[
+                        dict(
+                            label="线性Y轴",
+                            method="relayout",
+                            args=[linear_args]
+                        ),
+                        dict(
+                            label="对数Y轴",
+                            method="relayout",
+                            args=[log_args]
+                        )
+                    ],
+                    direction="down",
+                    pad={"r": 10, "t": 10},
+                    showactive=True,
+                    x=0.1,
+                    xanchor="left",
+                    y=0.99,
+                    yanchor="top",
+                    bgcolor="lightblue",
+                    bordercolor="darkblue",
+                    font=dict(size=16, color="black"),
+                )
+            ]
+        )
+        
+        # 添加"Y轴类型"的按钮标签
+        fig.add_annotation(
+            dict(
+                x=0.1,
+                y=1.04,
+                xref="paper",
+                yref="paper",
+                text="<b>Y轴类型选择:</b>",
+                showarrow=False,
+                font=dict(size=16)
+            )
+        )
         
         fig.write_html(output_file)
         print(f"可视化结果已保存至 {output_file}")
@@ -449,16 +502,8 @@ class DeconvolutionProcessor:
         print("  第一阶段: Gold算法反卷积...")
         gold_result = self.gold_deconvolution(spectrum, iterations=100)
         
-        # 如果启用Wiener滤波，添加Wiener滤波步骤
-        if self.use_wiener:
-            print("  Wiener滤波处理...")
-            wiener_result = self.wiener_deconvolution(spectrum)
-            # 将Wiener结果与Gold结果结合
-            combined_result = (gold_result + wiener_result) / 2
-            # 使用加权平均结果作为下一阶段的初始估计
-            initial_estimate = combined_result
-        else:
-            initial_estimate = gold_result
+        # 直接使用Gold结果作为初始估计
+        initial_estimate = gold_result
         
         # 然后使用Richardson-Lucy算法改善细节
         print("  第二阶段: Richardson-Lucy算法精细反卷积...")
@@ -767,28 +812,36 @@ class DeconvolutionProcessor:
         deconvolved_spectra = []
         
         print("开始反卷积处理...")
+        if self.use_wiener:
+            print(f"应用Wiener滤波预处理, 信噪比={self.snr}")
         print(f"使用算法: {self.algorithm}")
         start_time = time.time()
         
         for i in range(len(noisy_spectra)):
             print(f"处理能谱 {i+1}/{len(noisy_spectra)}")
             
+            # 如果启用Wiener滤波，先对能谱进行预处理
+            current_spectrum = noisy_spectra[i].copy()
+            if self.use_wiener:
+                print("  应用Wiener滤波预处理...")
+                current_spectrum = self.wiener_deconvolution(current_spectrum)
+            
             # 根据选择的算法执行反卷积
             if self.algorithm == 'hybrid':
-                deconvolved = self.hybrid_deconvolution(noisy_spectra[i])
+                deconvolved = self.hybrid_deconvolution(current_spectrum)
             elif self.algorithm == 'sparse':
-                deconvolved = self.sparse_deconvolution(noisy_spectra[i])
+                deconvolved = self.sparse_deconvolution(current_spectrum)
             elif self.algorithm == 'blind':
-                deconvolved = self.blind_deconvolution(noisy_spectra[i])
+                deconvolved = self.blind_deconvolution(current_spectrum)
             elif self.algorithm == 'admm':
-                deconvolved = self.admm_deconvolution(noisy_spectra[i])
+                deconvolved = self.admm_deconvolution(current_spectrum)
             elif self.algorithm == 'bayesian':
-                deconvolved = self.bayesian_deconvolution(noisy_spectra[i])
+                deconvolved = self.bayesian_deconvolution(current_spectrum)
             elif self.algorithm == 'adaptive':
-                deconvolved = self.adaptive_deconvolution(noisy_spectra[i])
+                deconvolved = self.adaptive_deconvolution(current_spectrum)
             else:
                 print(f"未知算法: {self.algorithm}，使用默认的hybrid算法")
-                deconvolved = self.hybrid_deconvolution(noisy_spectra[i])
+                deconvolved = self.hybrid_deconvolution(current_spectrum)
             
             deconvolved_spectra.append(deconvolved)
         
@@ -798,11 +851,12 @@ class DeconvolutionProcessor:
     
     def visualize_results(self, x, original_spectra, noisy_spectra, deconvolved_spectra, output_file="deconvolution_results.html"):
         """可视化反卷积结果"""
-        fig = make_subplots(rows=len(original_spectra), cols=1, 
-                           subplot_titles=[f"能谱 {i+1} 反卷积结果" for i in range(len(original_spectra))],
+        num_spectra = len(original_spectra)
+        fig = make_subplots(rows=num_spectra, cols=1, 
+                           subplot_titles=[f"能谱 {i+1} 反卷积结果" for i in range(num_spectra)],
                            vertical_spacing=0.05)
         
-        for i in range(len(original_spectra)):
+        for i in range(num_spectra):
             fig.add_trace(
                 go.Scatter(x=x, y=original_spectra[i], mode='lines', name='原始能谱', 
                           line=dict(color='blue')),
@@ -821,9 +875,62 @@ class DeconvolutionProcessor:
                 row=i+1, col=1
             )
         
-        fig.update_layout(height=500*len(original_spectra), width=1000, 
-                         title="能谱反卷积结果",
-                         showlegend=False)
+        # 动态生成Y轴配置
+        linear_args = {}
+        log_args = {}
+        for i in range(1, num_spectra + 1):
+            axis_name = f"yaxis{i if i > 1 else ''}"
+            linear_args[f"{axis_name}.type"] = "linear"
+            log_args[f"{axis_name}.type"] = "log"
+        
+        # 添加按钮以切换对数/线性Y轴
+        fig.update_layout(
+            height=500*num_spectra, 
+            width=1000, 
+            title_text="能谱反卷积结果",
+            title_font=dict(size=24),
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            updatemenus=[
+                dict(
+                    buttons=[
+                        dict(
+                            label="线性Y轴",
+                            method="relayout",
+                            args=[linear_args]
+                        ),
+                        dict(
+                            label="对数Y轴",
+                            method="relayout",
+                            args=[log_args]
+                        )
+                    ],
+                    direction="down",
+                    pad={"r": 10, "t": 10},
+                    showactive=True,
+                    x=0.1,
+                    xanchor="left",
+                    y=0.99,
+                    yanchor="top",
+                    bgcolor="lightblue",
+                    bordercolor="darkblue",
+                    font=dict(size=16, color="black"),
+                )
+            ]
+        )
+        
+        # 添加"Y轴类型"的按钮标签
+        fig.add_annotation(
+            dict(
+                x=0.1,
+                y=1.04,
+                xref="paper",
+                yref="paper",
+                text="<b>Y轴类型选择:</b>",
+                showarrow=False,
+                font=dict(size=16)
+            )
+        )
         
         fig.write_html(output_file)
         print(f"反卷积结果已保存至 {output_file}")
@@ -832,7 +939,8 @@ class DeconvolutionProcessor:
 
 
 def main(num_spectra=10, rev=0.1, error_amplitude=1.0, use_wiener=False, snr=100.0, 
-         peak_enhancement=True, algorithm='hybrid', peak_intensity=30000):
+         peak_enhancement=True, algorithm='hybrid', peak_intensity=30000,
+         output_html="energy_spectra.html", output_results_html="deconvolution_results.html"):
     print(f"参数设置: 能谱数量={num_spectra}, 分辨率参数={rev}, 误差强度={error_amplitude}, 特征峰强度={peak_intensity}")
     if use_wiener:
         print(f"启用Wiener滤波, 信噪比={snr}")
@@ -845,13 +953,13 @@ def main(num_spectra=10, rev=0.1, error_amplitude=1.0, use_wiener=False, snr=100
                                        error_amplitude=error_amplitude,
                                        peak_intensity=peak_intensity)
     original_spectra, convolved_spectra, noisy_spectra = generator.generate_data()
-    generator.visualize_html("energy_spectra.html")
+    generator.visualize_html(output_html)
     
     # 反卷积处理
     deconvolver = DeconvolutionProcessor(rev=rev, use_wiener=use_wiener, snr=snr, 
                                         peak_enhancement=peak_enhancement, algorithm=algorithm)
     deconvolved_spectra = deconvolver.process_spectra(original_spectra, noisy_spectra)
-    deconvolver.visualize_results(generator.x, original_spectra, noisy_spectra, deconvolved_spectra, "deconvolution_results.html")
+    deconvolver.visualize_results(generator.x, original_spectra, noisy_spectra, deconvolved_spectra, output_results_html)
     
     print("所有处理完成!")
 
@@ -870,9 +978,12 @@ if __name__ == "__main__":
                        choices=["hybrid", "sparse", "blind", "admm", "bayesian", "adaptive"],
                        help="选择反卷积算法")
     parser.add_argument("--peak_intensity", type=float, default=30000.0, help="特征峰强度参数")
+    parser.add_argument("--output_html", type=str, default="energy_spectra.html", help="能谱可视化输出文件名")
+    parser.add_argument("--output_results_html", type=str, default="deconvolution_results.html", help="反卷积结果可视化输出文件名")
     
     args = parser.parse_args()
     
     main(num_spectra=args.num_spectra, rev=args.rev, error_amplitude=args.error_amplitude,
          use_wiener=args.use_wiener, snr=args.snr, peak_enhancement=not args.no_peak_enhancement,
-         algorithm=args.algorithm, peak_intensity=args.peak_intensity) 
+         algorithm=args.algorithm, peak_intensity=args.peak_intensity,
+         output_html=args.output_html, output_results_html=args.output_results_html) 
