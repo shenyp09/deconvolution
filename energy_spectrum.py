@@ -169,8 +169,161 @@ class EnergySpectrumGenerator:
 
 
 class DeconvolutionProcessor:
-    def __init__(self, rev=0.01):
+    def __init__(self, rev=0.01, use_wiener=False, snr=100.0):
         self.rev = rev  # 卷积参数
+        self.use_wiener = use_wiener  # 是否使用Wiener滤波
+        self.snr = snr  # Wiener滤波的信噪比参数
+        
+    def create_response_matrix(self, length):
+        """创建完整的响应矩阵，用于精确反卷积"""
+        response_matrix = np.zeros((length, length))
+        x = np.arange(1, length+1)
+        
+        for i in range(length):
+            energy = x[i]
+            sigma = self.rev * np.sqrt(energy)
+            
+            # 对每个能量点创建高斯响应
+            for j in range(length):
+                delta_e = x[j] - energy
+                response_matrix[i, j] = np.exp(-0.5 * (delta_e / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
+        
+        # 归一化每行
+        row_sums = response_matrix.sum(axis=1, keepdims=True)
+        response_matrix = response_matrix / np.where(row_sums > 0, row_sums, 1)
+        
+        return response_matrix
+    
+    def create_sparse_response_matrix(self, length):
+        """创建稀疏响应矩阵，只计算有意义的元素"""
+        response_matrix = np.zeros((length, length))
+        x = np.arange(1, length+1)
+        
+        for i in range(length):
+            energy = x[i]
+            sigma = self.rev * np.sqrt(energy)
+            
+            # 只计算3个sigma范围内的响应
+            window = int(6 * sigma)
+            start_j = max(0, i - window)
+            end_j = min(length, i + window + 1)
+            
+            for j in range(start_j, end_j):
+                delta_e = x[j] - energy
+                response_matrix[i, j] = np.exp(-0.5 * (delta_e / sigma) ** 2)
+        
+        # 归一化每行
+        row_sums = response_matrix.sum(axis=1, keepdims=True)
+        response_matrix = response_matrix / np.where(row_sums > 0, row_sums, 1)
+        
+        return response_matrix
+        
+    def gold_deconvolution(self, spectrum, iterations=200):
+        """使用Gold迭代反卷积算法，无降采样"""
+        length = len(spectrum)
+        
+        # 对于尖锐特征的反卷积，使用稀疏响应矩阵
+        response_matrix = self.create_sparse_response_matrix(length)
+        
+        # 初始估计（平滑的输入谱）
+        estimate = gaussian_filter1d(spectrum, sigma=2)
+        estimate = np.maximum(estimate, 1e-10)  # 避免零值
+        
+        # Gold迭代
+        for iter in range(iterations):
+            # 计算当前估计的卷积结果
+            forward = np.dot(response_matrix, estimate)
+            forward = np.maximum(forward, 1e-10)  # 避免零值
+            
+            # 计算比率
+            ratio = spectrum / forward
+            
+            # 应用比率更新估计
+            correction = np.dot(response_matrix.T, ratio)
+            estimate = estimate * correction
+            
+            # 避免负值或过小的值
+            estimate = np.maximum(estimate, 1e-10)
+            
+            # 应用正则化以减少噪声放大
+            if iter % 10 == 0 and iter > 0:
+                estimate = gaussian_filter1d(estimate, sigma=0.5)
+            
+            if iter % 20 == 0:
+                print(f"  反卷积迭代: {iter}/{iterations}")
+        
+        return estimate
+    
+    def wiener_deconvolution(self, spectrum):
+        """使用Wiener滤波进行反卷积"""
+        length = len(spectrum)
+        x = np.arange(1, length+1)
+        
+        # 创建频域响应函数
+        freqs = np.fft.fftfreq(length)
+        response = np.zeros(length, dtype=complex)
+        
+        # 使用设置的信噪比
+        snr = self.snr
+        
+        # 在频域中创建卷积核
+        for i in range(length):
+            energy = x[i]
+            sigma = self.rev * np.sqrt(energy)
+            kernel = np.exp(-0.5 * (x - energy)**2 / sigma**2)
+            kernel = kernel / np.sum(kernel)
+            
+            # 对每个能量点计算频域响应
+            kernel_fft = np.fft.fft(np.roll(kernel, length//2 - i))
+            response += kernel_fft / length
+        
+        # 归一化响应
+        response = response / np.abs(response).max()
+        
+        # 应用Wiener滤波
+        spectrum_fft = np.fft.fft(spectrum)
+        wiener_filter = np.conj(response) / (np.abs(response)**2 + 1/snr)
+        result_fft = spectrum_fft * wiener_filter
+        result = np.real(np.fft.ifft(result_fft))
+        
+        # 确保非负
+        result = np.maximum(result, 0)
+        
+        return result
+    
+    def richardson_lucy_deconvolution(self, spectrum, iterations=50):
+        """使用Richardson-Lucy反卷积算法"""
+        length = len(spectrum)
+        x = np.arange(1, length+1)
+        
+        # 创建响应矩阵
+        response_matrix = self.create_sparse_response_matrix(length)
+        
+        # 初始估计
+        estimate = np.copy(spectrum)
+        estimate = np.maximum(estimate, 1e-10)  # 避免零值
+        
+        # Richardson-Lucy迭代
+        for iter in range(iterations):
+            # 计算当前估计的卷积结果
+            forward = np.dot(response_matrix, estimate)
+            forward = np.maximum(forward, 1e-10)  # 避免零值
+            
+            # 计算比率并更新估计
+            ratio = spectrum / forward
+            estimate = estimate * np.dot(response_matrix.T, ratio)
+            
+            # 确保非负
+            estimate = np.maximum(estimate, 0)
+            
+            # 应用适度的正则化
+            if iter % 10 == 0 and iter > 0:
+                estimate = gaussian_filter1d(estimate, sigma=0.5)
+            
+            if iter % 10 == 0:
+                print(f"  RL反卷积迭代: {iter}/{iterations}")
+        
+        return estimate
         
     def optimize_deconvolution(self, spectrum, iterations=50, downsample_factor=4):
         """使用降采样优化的Gold反卷积算法"""
@@ -240,6 +393,53 @@ class DeconvolutionProcessor:
         
         return upsampled_estimate
     
+    def hybrid_deconvolution(self, spectrum):
+        """混合反卷积策略，针对尖锐特征峰优化"""
+        # 首先使用Gold算法获取初步结果
+        print("  第一阶段: Gold算法反卷积...")
+        gold_result = self.gold_deconvolution(spectrum, iterations=100)
+        
+        # 如果启用Wiener滤波，添加Wiener滤波步骤
+        if self.use_wiener:
+            print("  Wiener滤波处理...")
+            wiener_result = self.wiener_deconvolution(spectrum)
+            # 将Wiener结果与Gold结果结合
+            combined_result = (gold_result + wiener_result) / 2
+            # 使用加权平均结果作为下一阶段的初始估计
+            initial_estimate = combined_result
+        else:
+            initial_estimate = gold_result
+        
+        # 然后使用Richardson-Lucy算法改善细节
+        print("  第二阶段: Richardson-Lucy算法精细反卷积...")
+        # 使用前面的结果作为初始估计
+        length = len(spectrum)
+        
+        # 创建响应矩阵
+        response_matrix = self.create_sparse_response_matrix(length)
+        
+        # 设置初始估计
+        estimate = initial_estimate.copy()
+        estimate = np.maximum(estimate, 1e-10)
+        
+        # Richardson-Lucy精细迭代
+        for iter in range(30):
+            # 计算当前估计的卷积结果
+            forward = np.dot(response_matrix, estimate)
+            forward = np.maximum(forward, 1e-10)
+            
+            # 计算比率并更新估计
+            ratio = spectrum / forward
+            estimate = estimate * np.dot(response_matrix.T, ratio)
+            
+            # 确保非负
+            estimate = np.maximum(estimate, 0)
+            
+            if iter % 10 == 0:
+                print(f"  精细反卷积迭代: {iter}/30")
+        
+        return estimate
+    
     def process_spectra(self, original_spectra, noisy_spectra):
         """处理多个能谱并返回反卷积结果"""
         deconvolved_spectra = []
@@ -249,8 +449,8 @@ class DeconvolutionProcessor:
         
         for i in range(len(noisy_spectra)):
             print(f"处理能谱 {i+1}/{len(noisy_spectra)}")
-            # 使用优化的反卷积算法
-            deconvolved = self.optimize_deconvolution(noisy_spectra[i])
+            # 使用混合反卷积算法
+            deconvolved = self.hybrid_deconvolution(noisy_spectra[i])
             deconvolved_spectra.append(deconvolved)
         
         print(f"反卷积处理完成，耗时 {time.time() - start_time:.2f} 秒")
@@ -292,8 +492,10 @@ class DeconvolutionProcessor:
         return fig
 
 
-def main(num_spectra=10, rev=0.01, error_amplitude=1.0):
+def main(num_spectra=10, rev=0.01, error_amplitude=1.0, use_wiener=False, snr=100.0):
     print(f"参数设置: 能谱数量={num_spectra}, 分辨率参数={rev}, 误差强度={error_amplitude}")
+    if use_wiener:
+        print(f"启用Wiener滤波, 信噪比={snr}")
     
     # 生成能谱数据
     generator = EnergySpectrumGenerator(num_spectra=num_spectra, rev=rev, error_amplitude=error_amplitude)
@@ -301,7 +503,7 @@ def main(num_spectra=10, rev=0.01, error_amplitude=1.0):
     generator.visualize_html("energy_spectra.html")
     
     # 反卷积处理
-    deconvolver = DeconvolutionProcessor(rev=rev)
+    deconvolver = DeconvolutionProcessor(rev=rev, use_wiener=use_wiener, snr=snr)
     deconvolved_spectra = deconvolver.process_spectra(original_spectra, noisy_spectra)
     deconvolver.visualize_results(generator.x, original_spectra, noisy_spectra, deconvolved_spectra, "deconvolution_results.html")
     
@@ -315,7 +517,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_spectra", type=int, default=10, help="生成的能谱数量")
     parser.add_argument("--rev", type=float, default=0.01, help="分辨率参数，影响高斯卷积的宽度")
     parser.add_argument("--error_amplitude", type=float, default=1.0, help="统计误差强度参数")
+    parser.add_argument("--use_wiener", action="store_true", help="是否使用Wiener滤波")
+    parser.add_argument("--snr", type=float, default=100.0, help="Wiener滤波的信噪比参数")
     
     args = parser.parse_args()
     
-    main(num_spectra=args.num_spectra, rev=args.rev, error_amplitude=args.error_amplitude) 
+    main(num_spectra=args.num_spectra, rev=args.rev, error_amplitude=args.error_amplitude,
+         use_wiener=args.use_wiener, snr=args.snr) 
