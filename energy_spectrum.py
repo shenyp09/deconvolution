@@ -9,7 +9,7 @@ import json
 import time
 
 class EnergySpectrumGenerator:
-    def __init__(self, length=8192, num_spectra=10, rev=0.01, error_amplitude=1.0):
+    def __init__(self, length=8192, num_spectra=10, rev=1, error_amplitude=1.0):
         self.length = length
         self.num_spectra = num_spectra
         self.rev = rev  # 高斯卷积的分辨率参数
@@ -43,6 +43,32 @@ class EnergySpectrumGenerator:
         
         # 平滑整个谱
         spectrum = gaussian_filter1d(spectrum, sigma=50)
+        
+        # 添加特征峰
+        # 1. 添加几个窄的高斯特征峰
+        num_feature_peaks = np.random.randint(2, 5)  # 添加2-4个特征峰
+        
+        for _ in range(num_feature_peaks):
+            # 特征峰位置 - 在能谱的不同区域
+            region = np.random.choice(['低能', '中能', '高能'])
+            if region == '低能':
+                center = np.random.randint(500, 2000)
+            elif region == '中能':
+                center = np.random.randint(2000, 5000)
+            else:  # 高能
+                center = np.random.randint(5000, 7500)
+                
+            # 特征峰宽度设为1道
+            width = 1
+            # 特征峰高度通常较高
+            height = np.random.uniform(20000, 40000)
+            
+            # 生成高斯特征峰
+            feature_peak = np.zeros(self.length)
+            feature_peak[center] = height
+            spectrum += feature_peak
+            
+        
         
         return spectrum
         
