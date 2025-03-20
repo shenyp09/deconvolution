@@ -9,7 +9,7 @@ import json
 import time
 
 class EnergySpectrumGenerator:
-    def __init__(self, length=8192, num_spectra=10, rev=1, error_amplitude=1.0, peak_intensity=30000):
+    def __init__(self, length=8192, num_spectra=1, rev=0.1, error_amplitude=1.0, peak_intensity=30000):
         self.length = length
         self.num_spectra = num_spectra
         self.rev = rev  # 高斯卷积的分辨率参数
@@ -223,10 +223,10 @@ class EnergySpectrumGenerator:
 
 
 class DeconvolutionProcessor:
-    def __init__(self, rev=0.01, use_wiener=False, snr=100.0, peak_enhancement=True, algorithm='hybrid'):
+    def __init__(self, rev=0.01, filter_type=None, filter_params=None, peak_enhancement=True, algorithm='hybrid'):
         self.rev = rev  # 卷积参数
-        self.use_wiener = use_wiener  # 是否使用Wiener滤波
-        self.snr = snr  # Wiener滤波的信噪比参数
+        self.filter_type = filter_type  # 预处理滤波器类型：gaussian, median, bilateral, fft, savgol
+        self.filter_params = filter_params if filter_params else {}  # 滤波器参数
         self.peak_enhancement = peak_enhancement  # 是否启用峰增强模式
         self.algorithm = algorithm  # 使用的反卷积算法
         
@@ -356,43 +356,6 @@ class DeconvolutionProcessor:
                 print(f"  反卷积迭代: {iter}/{iterations}")
         
         return estimate
-    
-    def wiener_deconvolution(self, spectrum):
-        """使用Wiener滤波进行反卷积"""
-        length = len(spectrum)
-        x = np.arange(1, length+1)
-        
-        # 创建频域响应函数
-        freqs = np.fft.fftfreq(length)
-        response = np.zeros(length, dtype=complex)
-        
-        # 使用设置的信噪比
-        snr = self.snr
-        
-        # 在频域中创建卷积核
-        for i in range(length):
-            energy = x[i]
-            sigma = self.rev * np.sqrt(energy)
-            kernel = np.exp(-0.5 * (x - energy)**2 / sigma**2)
-            kernel = kernel / np.sum(kernel)
-            
-            # 对每个能量点计算频域响应
-            kernel_fft = np.fft.fft(np.roll(kernel, length//2 - i))
-            response += kernel_fft / length
-        
-        # 归一化响应
-        response = response / np.abs(response).max()
-        
-        # 应用Wiener滤波
-        spectrum_fft = np.fft.fft(spectrum)
-        wiener_filter = np.conj(response) / (np.abs(response)**2 + 1/snr)
-        result_fft = spectrum_fft * wiener_filter
-        result = np.real(np.fft.ifft(result_fft))
-        
-        # 确保非负
-        result = np.maximum(result, 0)
-        
-        return result
     
     def richardson_lucy_deconvolution(self, spectrum, iterations=50):
         """使用Richardson-Lucy反卷积算法"""
@@ -807,24 +770,115 @@ class DeconvolutionProcessor:
         
         return estimate
     
+    def gaussian_filter(self, spectrum, sigma=2.0):
+        """使用高斯滤波进行平滑"""
+        from scipy.ndimage import gaussian_filter1d
+        return gaussian_filter1d(spectrum, sigma=sigma)
+    
+    def median_filter(self, spectrum, size=5):
+        """使用中值滤波去除脉冲噪声"""
+        from scipy.signal import medfilt
+        return medfilt(spectrum, kernel_size=size)
+    
+    def bilateral_filter(self, spectrum, sigma_space=2.0, sigma_intensity=1.0):
+        """使用双边滤波保留边缘"""
+        filtered = np.copy(spectrum)
+        length = len(spectrum)
+        
+        for i in range(length):
+            # 定义窗口
+            window_size = int(sigma_space * 3)
+            start = max(0, i - window_size)
+            end = min(length, i + window_size + 1)
+            window = spectrum[start:end]
+            positions = np.arange(start, end)
+            
+            # 计算空间权重
+            space_weights = np.exp(-0.5 * ((positions - i) / sigma_space) ** 2)
+            
+            # 计算强度权重
+            intensity_weights = np.exp(-0.5 * ((window - spectrum[i]) / sigma_intensity) ** 2)
+            
+            # 组合权重
+            weights = space_weights * intensity_weights
+            weights = weights / np.sum(weights)
+            
+            # 应用权重
+            filtered[i] = np.sum(window * weights)
+        
+        return filtered
+    
+    def fft_filter(self, spectrum, cutoff_freq=0.1):
+        """使用傅里叶变换滤波去除高频噪声"""
+        # 应用FFT
+        spectrum_fft = np.fft.rfft(spectrum)
+        
+        # 创建低通滤波器
+        freq = np.fft.rfftfreq(len(spectrum))
+        filter_mask = freq < cutoff_freq
+        
+        # 应用滤波器
+        filtered_fft = spectrum_fft * filter_mask
+        
+        # 反变换回时域
+        filtered = np.fft.irfft(filtered_fft, len(spectrum))
+        
+        return filtered
+    
+    def savgol_filter(self, spectrum, window_length=11, polyorder=3):
+        """使用Savitzky-Golay滤波，保留峰形状"""
+        from scipy.signal import savgol_filter
+        return savgol_filter(spectrum, window_length=window_length, polyorder=polyorder)
+    
+    def apply_filter(self, spectrum):
+        """根据设置的滤波器类型应用相应的滤波"""
+        if self.filter_type is None:
+            return spectrum
+        
+        if self.filter_type == 'gaussian':
+            sigma = self.filter_params.get('sigma', 2.0)
+            return self.gaussian_filter(spectrum, sigma=sigma)
+        
+        elif self.filter_type == 'median':
+            size = self.filter_params.get('size', 5)
+            return self.median_filter(spectrum, size=size)
+        
+        elif self.filter_type == 'bilateral':
+            sigma_space = self.filter_params.get('sigma_space', 2.0)
+            sigma_intensity = self.filter_params.get('sigma_intensity', 1.0)
+            return self.bilateral_filter(spectrum, sigma_space=sigma_space, sigma_intensity=sigma_intensity)
+        
+        elif self.filter_type == 'fft':
+            cutoff_freq = self.filter_params.get('cutoff_freq', 0.1)
+            return self.fft_filter(spectrum, cutoff_freq=cutoff_freq)
+        
+        elif self.filter_type == 'savgol':
+            window_length = self.filter_params.get('window_length', 11)
+            polyorder = self.filter_params.get('polyorder', 3)
+            return self.savgol_filter(spectrum, window_length=window_length, polyorder=polyorder)
+        
+        else:
+            print(f"未知滤波器类型: {self.filter_type}，不进行预处理")
+            return spectrum
+
     def process_spectra(self, original_spectra, noisy_spectra):
         """处理多个能谱并返回反卷积结果"""
         deconvolved_spectra = []
         
         print("开始反卷积处理...")
-        if self.use_wiener:
-            print(f"应用Wiener滤波预处理, 信噪比={self.snr}")
+        if self.filter_type:
+            print(f"应用预处理滤波: {self.filter_type}，参数: {self.filter_params}")
         print(f"使用算法: {self.algorithm}")
         start_time = time.time()
         
         for i in range(len(noisy_spectra)):
             print(f"处理能谱 {i+1}/{len(noisy_spectra)}")
             
-            # 如果启用Wiener滤波，先对能谱进行预处理
+            # 应用预处理滤波
             current_spectrum = noisy_spectra[i].copy()
-            if self.use_wiener:
-                print("  应用Wiener滤波预处理...")
-                current_spectrum = self.wiener_deconvolution(current_spectrum)
+            if self.filter_type:
+                print(f"  应用{self.filter_type}滤波预处理...")
+                current_spectrum = self.apply_filter(current_spectrum)
             
             # 根据选择的算法执行反卷积
             if self.algorithm == 'hybrid':
@@ -938,12 +992,12 @@ class DeconvolutionProcessor:
         return fig
 
 
-def main(num_spectra=10, rev=0.1, error_amplitude=1.0, use_wiener=False, snr=100.0, 
+def main(num_spectra=10, rev=0.1, error_amplitude=1.0, filter_type=None, filter_params=None, 
          peak_enhancement=True, algorithm='hybrid', peak_intensity=30000,
          output_html="energy_spectra.html", output_results_html="deconvolution_results.html"):
     print(f"参数设置: 能谱数量={num_spectra}, 分辨率参数={rev}, 误差强度={error_amplitude}, 特征峰强度={peak_intensity}")
-    if use_wiener:
-        print(f"启用Wiener滤波, 信噪比={snr}")
+    if filter_type:
+        print(f"启用{filter_type}滤波预处理, 参数: {filter_params}")
     if peak_enhancement:
         print("启用峰增强模式")
     print(f"使用反卷积算法: {algorithm}")
@@ -956,7 +1010,7 @@ def main(num_spectra=10, rev=0.1, error_amplitude=1.0, use_wiener=False, snr=100
     generator.visualize_html(output_html)
     
     # 反卷积处理
-    deconvolver = DeconvolutionProcessor(rev=rev, use_wiener=use_wiener, snr=snr, 
+    deconvolver = DeconvolutionProcessor(rev=rev, filter_type=filter_type, filter_params=filter_params, 
                                         peak_enhancement=peak_enhancement, algorithm=algorithm)
     deconvolved_spectra = deconvolver.process_spectra(original_spectra, noisy_spectra)
     deconvolver.visualize_results(generator.x, original_spectra, noisy_spectra, deconvolved_spectra, output_results_html)
@@ -969,10 +1023,15 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="能谱生成与反卷积处理")
     parser.add_argument("--num_spectra", type=int, default=10, help="生成的能谱数量")
-    parser.add_argument("--rev", type=float, default=0.01, help="分辨率参数，影响高斯卷积的宽度")
+    parser.add_argument("--rev", type=float, default=0.1, help="分辨率参数，影响高斯卷积的宽度")
     parser.add_argument("--error_amplitude", type=float, default=1.0, help="统计误差强度参数")
-    parser.add_argument("--use_wiener", action="store_true", help="是否使用Wiener滤波")
-    parser.add_argument("--snr", type=float, default=100.0, help="Wiener滤波的信噪比参数")
+    parser.add_argument("--filter", type=str, choices=["gaussian", "median", "bilateral", "fft", "savgol"], 
+                       help="选择预处理滤波器类型")
+    parser.add_argument("--filter_sigma", type=float, default=2.0, help="高斯滤波的sigma参数")
+    parser.add_argument("--filter_size", type=int, default=5, help="中值滤波的窗口大小")
+    parser.add_argument("--filter_cutoff", type=float, default=0.1, help="FFT滤波的截止频率")
+    parser.add_argument("--filter_window", type=int, default=11, help="Savgol滤波的窗口大小")
+    parser.add_argument("--filter_order", type=int, default=3, help="Savgol滤波的多项式阶数")
     parser.add_argument("--no_peak_enhancement", action="store_true", help="禁用峰增强模式")
     parser.add_argument("--algorithm", type=str, default="hybrid", 
                        choices=["hybrid", "sparse", "blind", "admm", "bayesian", "adaptive"],
@@ -983,7 +1042,22 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    # 根据选择的滤波器类型设置参数
+    filter_params = None
+    if args.filter:
+        if args.filter == 'gaussian':
+            filter_params = {'sigma': args.filter_sigma}
+        elif args.filter == 'median':
+            filter_params = {'size': args.filter_size}
+        elif args.filter == 'bilateral':
+            filter_params = {'sigma_space': args.filter_sigma, 'sigma_intensity': 1.0}
+        elif args.filter == 'fft':
+            filter_params = {'cutoff_freq': args.filter_cutoff}
+        elif args.filter == 'savgol':
+            filter_params = {'window_length': args.filter_window, 'polyorder': args.filter_order}
+    
     main(num_spectra=args.num_spectra, rev=args.rev, error_amplitude=args.error_amplitude,
-         use_wiener=args.use_wiener, snr=args.snr, peak_enhancement=not args.no_peak_enhancement,
+         filter_type=args.filter, filter_params=filter_params, 
+         peak_enhancement=not args.no_peak_enhancement,
          algorithm=args.algorithm, peak_intensity=args.peak_intensity,
          output_html=args.output_html, output_results_html=args.output_results_html) 
