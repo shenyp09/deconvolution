@@ -18,6 +18,7 @@
    - 对生成的实际能谱进行反卷积
    - 与原始能谱进行对比
    - 使用HTML可视化结果，支持线性/对数Y轴切换
+   - 可配置各算法迭代次数，灵活控制计算精度与执行时间
 
 ## 支持的反卷积算法
 
@@ -74,6 +75,15 @@ python energy_spectrum.py
 - `--output_html`：能谱可视化输出文件名（默认：energy_spectra.html）
 - `--output_results_html`：反卷积结果可视化输出文件名（默认：deconvolution_results.html）
 
+### 算法迭代次数参数
+
+- `--iterations_sparse`：稀疏反卷积(ISTA)算法迭代次数（默认：50）
+- `--iterations_blind`：盲反卷积算法迭代次数（默认：20）
+- `--iterations_admm`：ADMM反卷积算法迭代次数（默认：50）
+- `--iterations_bayesian`：贝叶斯反卷积算法迭代次数（默认：50）
+- `--iterations_hybrid_gold`：混合反卷积Gold算法阶段迭代次数（默认：100）
+- `--iterations_hybrid_rl`：混合反卷积Richardson-Lucy算法阶段迭代次数（默认：30）
+
 例如：
 
 ```bash
@@ -86,18 +96,21 @@ python energy_spectrum.py --algorithm bayesian --filter gaussian --filter_sigma 
 # 使用ADMM算法和Savitzky-Golay滤波处理高分辨率的能谱
 python energy_spectrum.py --algorithm admm --rev 0.005 --filter savgol --filter_window 15
 
-# 使用中值滤波去除脉冲噪声
-python energy_spectrum.py --filter median --filter_size 7
+# 调整反卷积算法迭代次数提高精度
+python energy_spectrum.py --algorithm sparse --iterations_sparse 100
 
-# 使用FFT滤波去除高频噪声
-python energy_spectrum.py --filter fft --filter_cutoff 0.08
+# 减少迭代次数以加快处理速度
+python energy_spectrum.py --algorithm bayesian --iterations_bayesian 20
+
+# 调整混合算法两个阶段的迭代次数
+python energy_spectrum.py --algorithm hybrid --iterations_hybrid_gold 50 --iterations_hybrid_rl 20
 ```
 
 ## 输出
 
 程序会生成两个HTML文件：
 - `energy_spectra.html`：包含生成的原始能谱和卷积后带噪声的能谱
-- `deconvolution_results.html`：包含原始能谱、卷积后带噪声的能谱以及反卷积结果的对比
+- `deconvolution_results.html`：包含原始能谱、卷积后带噪声的能谱、预处理后的能谱以及反卷积结果的对比
 - 生成的HTML页面支持线性/对数Y轴切换，可通过左上角下拉菜单操作
 
 ## 算法性能比较
@@ -123,4 +136,12 @@ python energy_spectrum.py --filter fft --filter_cutoff 0.08
 - 特征峰强度参数控制生成的尖锐特征峰的高度
 - 较高的强度值（如50000）可以生成明显的特征峰，更容易被反卷积识别
 - 较低的强度值（如10000）可以测试算法对弱特征的恢复能力
-- 默认值30000适合大多数测试场景 
+- 默认值30000适合大多数测试场景
+
+## 迭代次数优化建议
+
+- **稀疏反卷积(ISTA)**：增加迭代次数(80-100)可提高细节恢复能力，但会增加噪声；减少迭代次数(20-30)处理速度更快但精度降低
+- **盲反卷积**：通常20-30次迭代已足够，过多迭代可能导致过拟合
+- **ADMM反卷积**：对迭代次数较为敏感，推荐50-100次迭代获得最佳效果
+- **贝叶斯反卷积**：30-50次迭代通常能达到良好平衡，对噪声较大的数据可适当增加迭代次数
+- **混合反卷积**：Gold阶段(50-100次)负责恢复主要特征，RL阶段(20-40次)负责精细化，可根据需要分别调整 

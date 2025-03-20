@@ -223,13 +223,24 @@ class EnergySpectrumGenerator:
 
 
 class DeconvolutionProcessor:
-    def __init__(self, rev=0.01, filter_type=None, filter_params=None, peak_enhancement=True, algorithm='hybrid'):
+    def __init__(self, rev=0.01, filter_type=None, filter_params=None, peak_enhancement=True, algorithm='hybrid',
+                 iterations_sparse=50, iterations_blind=20, iterations_admm=50, iterations_bayesian=50, 
+                 iterations_hybrid_gold=100, iterations_hybrid_rl=30):
         self.rev = rev  # 卷积参数
         self.filter_type = filter_type  # 预处理滤波器类型：gaussian, median, bilateral, fft, savgol
         self.filter_params = filter_params if filter_params else {}  # 滤波器参数
         self.peak_enhancement = peak_enhancement  # 是否启用峰增强模式
         self.algorithm = algorithm  # 使用的反卷积算法
         
+        # 各种算法的迭代次数
+        self.iterations_sparse = iterations_sparse
+        self.iterations_blind = iterations_blind
+        self.iterations_admm = iterations_admm
+        self.iterations_bayesian = iterations_bayesian
+        self.iterations_hybrid_gold = iterations_hybrid_gold
+        self.iterations_hybrid_rl = iterations_hybrid_rl
+        self.snr = 100.0  # 为blind算法保留
+    
     def find_potential_peaks(self, spectrum, threshold_factor=3.0, min_width=1, max_width=10):
         """寻找可能的尖锐特征峰位置"""
         length = len(spectrum)
@@ -463,7 +474,7 @@ class DeconvolutionProcessor:
         """混合反卷积策略，针对尖锐特征峰优化"""
         # 首先使用Gold算法获取初步结果
         print("  第一阶段: Gold算法反卷积...")
-        gold_result = self.gold_deconvolution(spectrum, iterations=100)
+        gold_result = self.gold_deconvolution(spectrum, iterations=self.iterations_hybrid_gold)
         
         # 直接使用Gold结果作为初始估计
         initial_estimate = gold_result
@@ -481,7 +492,7 @@ class DeconvolutionProcessor:
         estimate = np.maximum(estimate, 1e-10)
         
         # Richardson-Lucy精细迭代
-        for iter in range(30):
+        for iter in range(self.iterations_hybrid_rl):
             # 计算当前估计的卷积结果
             forward = np.dot(response_matrix, estimate)
             forward = np.maximum(forward, 1e-10)
@@ -494,11 +505,11 @@ class DeconvolutionProcessor:
             estimate = np.maximum(estimate, 0)
             
             if iter % 10 == 0:
-                print(f"  精细反卷积迭代: {iter}/30")
+                print(f"  精细反卷积迭代: {iter}/{self.iterations_hybrid_rl}")
         
         return estimate
     
-    def sparse_deconvolution(self, spectrum, iterations=50, lambda_reg=0.01):
+    def sparse_deconvolution(self, spectrum, lambda_reg=0.01):
         """使用稀疏反卷积算法，特别优化尖锐特征峰的恢复"""
         length = len(spectrum)
         
@@ -511,7 +522,7 @@ class DeconvolutionProcessor:
         
         print("  开始稀疏反卷积(ISTA)...")
         # ISTA迭代（迭代收缩阈值算法）
-        for iter in range(iterations):
+        for iter in range(self.iterations_sparse):
             # 计算梯度
             forward = np.dot(response_matrix, estimate)
             residual = spectrum - forward
@@ -529,7 +540,7 @@ class DeconvolutionProcessor:
             estimate = np.maximum(estimate, 0)
             
             if iter % 10 == 0:
-                print(f"  稀疏反卷积迭代: {iter}/{iterations}")
+                print(f"  稀疏反卷积迭代: {iter}/{self.iterations_sparse}")
         
         # 针对可能的峰值位置进行增强
         if self.peak_enhancement:
@@ -548,43 +559,7 @@ class DeconvolutionProcessor:
         
         return estimate
     
-    def _create_psf_matrix(self, psf, length):
-        """根据PSF创建卷积矩阵"""
-        psf_len = len(psf)
-        psf_center = psf_len // 2
-        psf_matrix = np.zeros((length, length))
-        
-        for i in range(length):
-            for j in range(max(0, i-psf_center), min(length, i+psf_len-psf_center)):
-                if 0 <= j-i+psf_center < psf_len:
-                    psf_matrix[i, j] = psf[j-i+psf_center]
-        
-        return psf_matrix
-    
-    def _update_psf(self, spectrum, estimate, psf_len=21):
-        """更新点扩散函数的估计"""
-        # 创建Toeplitz矩阵
-        length = len(spectrum)
-        A = np.zeros((length, psf_len))
-        
-        for i in range(length):
-            for j in range(psf_len):
-                idx = i - (j - psf_len//2)
-                if 0 <= idx < length:
-                    A[i, j] = estimate[idx]
-        
-        # 使用非负最小二乘解决Ax = b
-        from scipy.optimize import nnls
-        psf_new, _ = nnls(A, spectrum)
-        
-        # 归一化
-        psf_sum = np.sum(psf_new)
-        if psf_sum > 0:
-            psf_new = psf_new / psf_sum
-        
-        return psf_new
-    
-    def blind_deconvolution(self, spectrum, iterations=20):
+    def blind_deconvolution(self, spectrum):
         """盲反卷积方法，同时估计点扩散函数和原始信号"""
         length = len(spectrum)
         
@@ -597,7 +572,7 @@ class DeconvolutionProcessor:
         psf_estimate[psf_len//2] = 1.0  # 初始为单位脉冲
         
         print("  开始盲反卷积...")
-        for iter in range(iterations):
+        for iter in range(self.iterations_blind):
             # 1. 使用当前PSF估计更新信号估计
             psf_matrix = self._create_psf_matrix(psf_estimate, length)
             
@@ -615,12 +590,12 @@ class DeconvolutionProcessor:
             estimate = np.maximum(estimate, 0)
             
             # 2. 使用当前信号估计更新PSF
-            if iter < iterations - 1:  # 最后一次迭代不更新PSF
+            if iter < self.iterations_blind - 1:  # 最后一次迭代不更新PSF
                 psf_new = self._update_psf(spectrum, estimate, psf_len)
                 psf_estimate = psf_new
             
             if iter % 5 == 0:
-                print(f"  盲反卷积迭代: {iter}/{iterations}")
+                print(f"  盲反卷积迭代: {iter}/{self.iterations_blind}")
         
         # 峰值增强
         if self.peak_enhancement:
@@ -639,7 +614,7 @@ class DeconvolutionProcessor:
         
         return estimate
     
-    def admm_deconvolution(self, spectrum, iterations=50, rho=1.0):
+    def admm_deconvolution(self, spectrum, rho=1.0):
         """使用ADMM（交替方向乘子法）进行反卷积"""
         length = len(spectrum)
         
@@ -652,7 +627,7 @@ class DeconvolutionProcessor:
         u = np.zeros_like(x)   # 拉格朗日乘子
         
         print("  开始ADMM反卷积...")
-        for iter in range(iterations):
+        for iter in range(self.iterations_admm):
             # 更新x（使用伪逆解决线性系统）
             RTR = response_matrix.T @ response_matrix
             I = np.eye(length)
@@ -674,7 +649,7 @@ class DeconvolutionProcessor:
             z_change = np.linalg.norm(z - z_old)
             
             if iter % 10 == 0:
-                print(f"  ADMM迭代: {iter}/{iterations}, 残差: {x_change:.6f}")
+                print(f"  ADMM迭代: {iter}/{self.iterations_admm}, 残差: {x_change:.6f}")
                 
             if x_change < 1e-4 and z_change < 1e-4:
                 print(f"  ADMM提前收敛于迭代 {iter}")
@@ -698,7 +673,7 @@ class DeconvolutionProcessor:
         
         return x
     
-    def bayesian_deconvolution(self, spectrum, iterations=50):
+    def bayesian_deconvolution(self, spectrum):
         """贝叶斯反卷积方法，使用先验知识改善结果"""
         length = len(spectrum)
         
@@ -724,7 +699,7 @@ class DeconvolutionProcessor:
                 prior[peak_pos] = 2.0  # 峰位置处最高概率
         
         print("  开始贝叶斯反卷积...")
-        for iter in range(iterations):
+        for iter in range(self.iterations_bayesian):
             # 1. 计算当前估计的前向投影
             forward = np.dot(response_matrix, estimate)
             forward = np.maximum(forward, 1e-10)
@@ -758,7 +733,7 @@ class DeconvolutionProcessor:
                 estimate[~peak_mask] = smoothed[~peak_mask]
             
             if iter % 10 == 0:
-                print(f"  贝叶斯反卷积迭代: {iter}/{iterations}")
+                print(f"  贝叶斯反卷积迭代: {iter}/{self.iterations_bayesian}")
         
         # 峰值增强
         if self.peak_enhancement:
@@ -1011,6 +986,8 @@ class DeconvolutionProcessor:
 
 def main(num_spectra=10, rev=0.1, error_amplitude=1.0, filter_type=None, filter_params=None, 
          peak_enhancement=True, algorithm='hybrid', peak_intensity=30000,
+         iterations_sparse=50, iterations_blind=20, iterations_admm=50, iterations_bayesian=50,
+         iterations_hybrid_gold=100, iterations_hybrid_rl=30,
          output_html="energy_spectra.html", output_results_html="deconvolution_results.html"):
     print(f"参数设置: 能谱数量={num_spectra}, 分辨率参数={rev}, 误差强度={error_amplitude}, 特征峰强度={peak_intensity}")
     if filter_type:
@@ -1018,6 +995,18 @@ def main(num_spectra=10, rev=0.1, error_amplitude=1.0, filter_type=None, filter_
     if peak_enhancement:
         print("启用峰增强模式")
     print(f"使用反卷积算法: {algorithm}")
+    
+    # 打印迭代次数信息
+    if algorithm == 'sparse':
+        print(f"稀疏反卷积迭代次数: {iterations_sparse}")
+    elif algorithm == 'blind':
+        print(f"盲反卷积迭代次数: {iterations_blind}")
+    elif algorithm == 'admm':
+        print(f"ADMM反卷积迭代次数: {iterations_admm}")
+    elif algorithm == 'bayesian':
+        print(f"贝叶斯反卷积迭代次数: {iterations_bayesian}")
+    elif algorithm == 'hybrid':
+        print(f"混合反卷积迭代次数: Gold={iterations_hybrid_gold}, RL={iterations_hybrid_rl}")
     
     # 生成能谱数据
     generator = EnergySpectrumGenerator(num_spectra=num_spectra, rev=rev, 
@@ -1028,7 +1017,13 @@ def main(num_spectra=10, rev=0.1, error_amplitude=1.0, filter_type=None, filter_
     
     # 反卷积处理
     deconvolver = DeconvolutionProcessor(rev=rev, filter_type=filter_type, filter_params=filter_params, 
-                                        peak_enhancement=peak_enhancement, algorithm=algorithm)
+                                         peak_enhancement=peak_enhancement, algorithm=algorithm,
+                                         iterations_sparse=iterations_sparse, 
+                                         iterations_blind=iterations_blind, 
+                                         iterations_admm=iterations_admm, 
+                                         iterations_bayesian=iterations_bayesian,
+                                         iterations_hybrid_gold=iterations_hybrid_gold,
+                                         iterations_hybrid_rl=iterations_hybrid_rl)
     deconvolved_spectra = deconvolver.process_spectra(original_spectra, noisy_spectra)
     deconvolver.visualize_results(generator.x, original_spectra, noisy_spectra, deconvolved_spectra, output_results_html)
     
@@ -1057,6 +1052,14 @@ if __name__ == "__main__":
     parser.add_argument("--output_html", type=str, default="energy_spectra.html", help="能谱可视化输出文件名")
     parser.add_argument("--output_results_html", type=str, default="deconvolution_results.html", help="反卷积结果可视化输出文件名")
     
+    # 添加各算法迭代次数参数
+    parser.add_argument("--iterations_sparse", type=int, default=50, help="稀疏反卷积算法迭代次数")
+    parser.add_argument("--iterations_blind", type=int, default=20, help="盲反卷积算法迭代次数")
+    parser.add_argument("--iterations_admm", type=int, default=50, help="ADMM反卷积算法迭代次数")
+    parser.add_argument("--iterations_bayesian", type=int, default=50, help="贝叶斯反卷积算法迭代次数")
+    parser.add_argument("--iterations_hybrid_gold", type=int, default=100, help="混合反卷积Gold算法阶段迭代次数")
+    parser.add_argument("--iterations_hybrid_rl", type=int, default=30, help="混合反卷积Richardson-Lucy算法阶段迭代次数")
+    
     args = parser.parse_args()
     
     # 根据选择的滤波器类型设置参数
@@ -1077,4 +1080,10 @@ if __name__ == "__main__":
          filter_type=args.filter, filter_params=filter_params, 
          peak_enhancement=not args.no_peak_enhancement,
          algorithm=args.algorithm, peak_intensity=args.peak_intensity,
+         iterations_sparse=args.iterations_sparse,
+         iterations_blind=args.iterations_blind,
+         iterations_admm=args.iterations_admm,
+         iterations_bayesian=args.iterations_bayesian,
+         iterations_hybrid_gold=args.iterations_hybrid_gold,
+         iterations_hybrid_rl=args.iterations_hybrid_rl,
          output_html=args.output_html, output_results_html=args.output_results_html) 
